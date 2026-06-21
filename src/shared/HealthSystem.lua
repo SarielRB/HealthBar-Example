@@ -3,56 +3,46 @@
 
 --[[
 	HealthSystem
-	------------
-	A single, self-contained ModuleScript that bundles two cooperating classes:
+	one module, two classes glued together so you only require() once.
 
-	  1. Damageable  - a logical health container exposing health math + signals
-	                   (HealthChanged, Died, Destroyed). It is purely data and
-	                   contains zero rendering code so it can be reused on the
-	                   server (authoritative) or client (visual prediction).
+	Damageable -> just numbers + signals. no GUI stuff in here on purpose,
+	            so I can reuse it on the server for real hp and on the client
+	            for predicted hp without dragging UI code along.
+	HealthGui  -> the view. binds to a Damageable and animates two bars:
+	            a bright one that snaps to the new value and a grey one that
+	            lags behind so you can see the chunk you just lost. stole the
+	            idea from like every fighting game ever.
 
-	  2. HealthGui   - a view/controller that binds a Damageable to a BillboardGui
-	                   and animates two stacked bars: a fast "current" bar that
-	                   snaps to the new value and a slow "grey" bar that trails
-	                   behind to communicate how much damage was just taken
-	                   (a pattern used in many fighting/MOBA games).
+	the bars aren't resized frames - they're a colored frame masked by a
+	UIGradient's transparency. cheaper than poking Size every frame and it
+	doesn't care what shape the bar is.
 
-	The animation is driven by a UIGradient.Transparency NumberSequence rather
-	than by resizing a Frame. This avoids any reflow/layout cost on the GUI
-	hierarchy and allows the bar to be skewed, rounded, or shaped without the
-	usual scaling artifacts. The fraction is encoded as a sharp step in the
-	gradient: pixels left of the step are fully opaque, pixels right of it
-	are fully transparent.
-
-	A custom lightweight Signal implementation is used instead of BindableEvents
-	so the module also works inside the studio command bar, in tests, and inside
-	parallel Luau actors where BindableEvents are restricted.
+	using a hand-rolled signal instead of BindableEvent so this still works
+	in the command bar, in tests, and inside parallel actors.
 ]]
 
 local RunService = game:GetService("RunService")
 
 --==================================================================--
--- TUNABLES                                                          --
+-- knobs                                                             --
 --==================================================================--
 
--- Higher rate = bar catches up to its target faster. These values are tuned
--- so that the bright bar feels "responsive" while the grey bar feels "heavy".
-local CURRENT_RATE = 20  -- per-second exponential approach rate for bright bar
-local GREY_RATE = 6      -- per-second exponential approach rate for trailing bar
+-- how fast each bar chases its target. bright one snappy, grey one lazy.
+-- tweak these to taste, they're not magic numbers.
+local CURRENT_RATE = 20
+local GREY_RATE = 6
 
--- Epsilons used to make the gradient render a perfectly sharp edge.
--- SHARP_EPS controls the width of the transition keypoints; if it is too
--- large the bar looks blurry, if it is exactly 0 Roblox rejects the sequence
--- because two keypoints would share the same Time value.
+-- the gradient needs two keypoints with *almost* the same time to fake a
+-- hard edge. exactly the same time = roblox yells at you, too far apart
+-- and the bar looks fuzzy. 0.001 is the sweet spot I landed on.
 local SHARP_EPS = 0.001
 
--- Once the displayed value is within DONE_EPS of the target we snap and bail
--- out of the render loop. This avoids the loop running forever at floating
--- point noise levels (~1e-7) and burning Heartbeats for no visible change.
+-- once we're this close to the target just snap and bail. without this
+-- the loop runs forever chasing floating point noise.
 local DONE_EPS = 0.0005
 
 --==================================================================--
--- TYPES                                                             --
+-- types                                                             --
 --==================================================================--
 
 type Handler = (...any) -> ()
@@ -87,13 +77,12 @@ export type HealthGui = {
 }
 
 --==================================================================--
--- SIGNAL                                                            --
+-- signal                                                            --
 --==================================================================--
--- A minimal, allocation-light signal. Handlers are stored in a flat array
--- which makes Fire O(n) but keeps Connect/Disconnect O(1) amortized.
--- Fire clones the handler list before iterating so a handler is allowed to
--- disconnect itself (or others) during dispatch without invalidating
--- iteration -- a footgun that BindableEvents do not have to worry about.
+-- bare bones. flat array of handlers, Fire spawns each in its own thread
+-- so one bad handler can't take down the rest. clone the list before
+-- iterating so handlers can disconnect themselves mid-fire without blowing
+-- up the loop - learned that one the hard way.
 
 local function newSignal(): Signal
 	local handlers: { Handler } = {}
@@ -103,9 +92,7 @@ local function newSignal(): Signal
 		table.insert(handlers, handler)
 		local conn = { Connected = true } :: Connection
 		function conn:Disconnect()
-			-- Guard against double-disconnects; table.find on an absent
-			-- handler returns nil, but the boolean keeps us from doing
-			-- the lookup twice for the common case.
+			-- guard against double-disconnects (people do it)
 			if not self.Connected then return end
 			self.Connected = false
 			local i = table.find(handlers, handler)
@@ -115,8 +102,6 @@ local function newSignal(): Signal
 	end
 
 	function signal:Fire(...)
-		-- task.spawn makes each handler run in its own thread so a single
-		-- yielding/erroring handler can never stall siblings.
 		for _, h in ipairs(table.clone(handlers)) do
 			task.spawn(h, ...)
 		end
@@ -130,19 +115,17 @@ local function newSignal(): Signal
 end
 
 --==================================================================--
--- DAMAGEABLE                                                        --
+-- damageable                                                        --
 --==================================================================--
--- Pure-logic class. Holds the canonical HP value and notifies observers.
--- Anything that wants to "have health" (a mob, a destructible crate, a
--- vehicle's armor segment) just wraps itself in one of these.
+-- holds the real hp number and fires events when it changes.
+-- mobs, crates, vehicle armor pieces - anything that needs hp.
 
 local Damageable = {}
 Damageable.__index = Damageable
 
 function Damageable.new(instance: Instance, maxHP: number): Damageable
-	-- We refuse zero/negative maxHP because every downstream calculation
-	-- (CurrentHP/MaxHP fractions, healing caps) would either NaN or be
-	-- meaningless. Failing loudly here saves hours of debugging later.
+	-- if you pass 0 every fraction calc downstream NaNs and you'll spend
+	-- an hour wondering why your bar is broken. fail loud here.
 	assert(maxHP > 0, "maxHP must be > 0")
 
 	local self: any = setmetatable({
@@ -152,8 +135,8 @@ function Damageable.new(instance: Instance, maxHP: number): Damageable
 		HealthChanged = newSignal(),
 		Died = newSignal(),
 		Destroyed = newSignal(),
-		-- Underscore-prefixed fields are private bookkeeping. _alive flips
-		-- once on the first kill so further damage is ignored cleanly.
+		-- underscore stuff is private. _alive flips once on first death
+		-- so further damage just gets ignored cleanly.
 		_alive = true,
 		_destroyed = false,
 	}, Damageable)
@@ -162,9 +145,8 @@ end
 
 function Damageable:ApplyDamage(amount: number, source: Instance?): number
 	local s = self :: any
-	-- Dead things take no damage, and zero/negative amounts are silently
-	-- dropped instead of being routed through Heal (which would be a
-	-- subtle bug where ApplyDamage(-10) heals 10).
+	-- dead things don't take damage. negative amounts get dropped instead
+	-- of secretly healing - had a bug like that once, never again.
 	if not s._alive or amount <= 0 then return 0 end
 
 	local before = s.CurrentHP
@@ -173,8 +155,8 @@ function Damageable:ApplyDamage(amount: number, source: Instance?): number
 	s.HealthChanged:Fire(after, before)
 
 	if after == 0 then
-		-- Flip the alive flag BEFORE firing Died so a Died handler that
-		-- queries IsAlive() sees the correct (dead) state.
+		-- flip alive BEFORE firing Died, otherwise a Died handler that
+		-- checks IsAlive() gets the wrong answer
 		s._alive = false
 		s.Died:Fire(source)
 	end
@@ -184,8 +166,7 @@ end
 
 function Damageable:Heal(amount: number): number
 	local s = self :: any
-	-- Dead entities cannot be healed by default; resurrection is a higher
-	-- level concept that callers can model by creating a fresh Damageable.
+	-- no resurrecting from heal. if you want res, make a new Damageable.
 	if not s._alive or amount <= 0 then return 0 end
 
 	local before = s.CurrentHP
@@ -204,9 +185,8 @@ function Damageable:Destroy()
 	if s._destroyed then return end
 	s._destroyed = true
 	s._alive = false
-	-- Fire Destroyed BEFORE wiping the connection lists so listeners get a
-	-- final chance to react; then drop references so handler closures are
-	-- collectable even if some outside code keeps holding the Signal table.
+	-- fire Destroyed first so listeners get one last chance, then nuke
+	-- the handler lists so closures can actually be collected
 	s.Destroyed:Fire()
 	s.HealthChanged:DisconnectAll()
 	s.Died:DisconnectAll()
@@ -214,16 +194,15 @@ function Damageable:Destroy()
 end
 
 --==================================================================--
--- GRADIENT HELPERS                                                  --
+-- gradient bar tricks                                               --
 --==================================================================--
--- The bar is rendered by masking a colored Frame with a UIGradient's
--- Transparency channel. By placing a hard step in the NumberSequence at
--- "fraction", the left portion stays visible and the right portion is
--- erased -- giving us a crisp, scalable health bar with zero layout work.
+-- the bar is a flat colored frame with a UIGradient on top. the gradient
+-- has a sharp step at "fraction" - left side fully visible, right side
+-- fully transparent. no resizing, no layout work, looks the same at any
+-- size or shape. wish I'd thought of this years ago.
 
 local function ensureGradient(parent: GuiObject): UIGradient
-	-- Idempotent: reuse a designer-authored UIGradient if one exists so the
-	-- artist's chosen color ramp is preserved; otherwise create a default.
+	-- reuse an existing one if the artist already set up a nice color ramp
 	local existing = parent:FindFirstChildOfClass("UIGradient")
 	if existing then return existing end
 	local g = Instance.new("UIGradient")
@@ -232,9 +211,9 @@ local function ensureGradient(parent: GuiObject): UIGradient
 end
 
 local function buildSequence(fraction: number): NumberSequence
-	-- Degenerate edges have to be handled explicitly because two keypoints
-	-- can never share the same Time, and a sequence with a step at 0 or 1
-	-- collapses to a flat NumberSequence anyway.
+	-- edge cases: at 0 or 1 the four-keypoint sequence collapses, and
+	-- roblox refuses sequences where two keypoints share a Time value.
+	-- just hand back the flat sequences for those.
 	if fraction <= SHARP_EPS then return NumberSequence.new(1) end
 	if fraction >= 1 - SHARP_EPS then return NumberSequence.new(0) end
 	return NumberSequence.new({
@@ -249,17 +228,18 @@ local function setFraction(g: UIGradient, fraction: number)
 	g.Transparency = buildSequence(fraction)
 end
 
--- Framerate-independent exponential approach. The (1 - exp(-rate * dt))
--- factor is the analytic solution to an exponential lerp, so the bar moves
--- the same visible distance per unit of real time regardless of whether
--- Heartbeat fires at 30, 60, or 240 Hz.
+-- framerate-independent lerp. (1 - exp(-rate*dt)) is the closed form of
+-- exponential approach, so the bar moves the same amount per real second
+-- whether you're at 30, 60, or 240 fps. if you've ever written
+-- "current = lerp(current, target, 0.1)" in a render loop, this is the
+-- fix for that.
 local function approach(current: number, target: number, rate: number, dt: number): number
 	return current + (target - current) * (1 - math.exp(-rate * dt))
 end
 
 local function stepBar(g: UIGradient, displayed: number, target: number, rate: number, dt: number): (number, boolean)
-	-- Snap and signal "done" when we are visually indistinguishable from
-	-- the target; this lets the outer loop exit instead of running forever.
+	-- snap when we're basically there. returns done=true so the outer
+	-- loop can quit instead of grinding on noise forever.
 	if math.abs(displayed - target) <= DONE_EPS then
 		if displayed ~= target then setFraction(g, target) end
 		return target, true
@@ -270,15 +250,15 @@ local function stepBar(g: UIGradient, displayed: number, target: number, rate: n
 end
 
 --==================================================================--
--- HEALTH GUI                                                        --
+-- health gui                                                        --
 --==================================================================--
 
 local HealthGui = {}
 HealthGui.__index = HealthGui
 
 function HealthGui.new(damageable: Damageable, billboardGui: BillboardGui): HealthGui
-	-- WaitForChild lets us tolerate the GUI streaming in slightly after the
-	-- module attaches, which is common with PlayerGui / replicated assets.
+	-- WaitForChild because PlayerGui / replicated stuff might not be in
+	-- yet when we get here
 	local container = billboardGui:WaitForChild("Container")
 	local bar = container:WaitForChild("HealthBar")
 	local grey = bar:WaitForChild("GreyHealth") :: GuiObject
@@ -294,9 +274,8 @@ function HealthGui.new(damageable: Damageable, billboardGui: BillboardGui): Heal
 		lerpThread = nil,
 	}, HealthGui)
 
-	-- Seed the displayed/target values to match the starting HP so the bar
-	-- pops in at the right size on the first frame rather than animating
-	-- in from full or empty.
+	-- seed everything to the current hp so the bar pops in at the right
+	-- size instead of animating from full or empty on the first frame
 	local f = math.clamp(damageable.CurrentHP / damageable.MaxHP, 0, 1)
 	self.currentDisplayed = f
 	self.currentTarget = f
@@ -308,9 +287,9 @@ function HealthGui.new(damageable: Damageable, billboardGui: BillboardGui): Heal
 	setFraction(self.greyGradient, f)
 	healthText.Text = `{damageable.CurrentHP} HP`
 
-	-- The render loop only exists while a bar is mid-animation. As soon as
-	-- both bars settle on their target we let it die so we are not paying
-	-- a Heartbeat callback per idle health bar in the world.
+	-- the render loop only runs while a bar is actually moving. once
+	-- both settle on target it dies. don't want a Heartbeat callback
+	-- ticking on every idle health bar in the world.
 	local function runLoop()
 		while not self.destroyed do
 			local dt = RunService.Heartbeat:Wait()
@@ -322,9 +301,8 @@ function HealthGui.new(damageable: Damageable, billboardGui: BillboardGui): Heal
 			local nextGrey, greyDone = stepBar(self.greyGradient, self.greyDisplayed, self.greyTarget, GREY_RATE, dt)
 			self.greyDisplayed = nextGrey
 
-			-- The text mirrors the slow (grey) bar so the number counts
-			-- down at the same pace the player sees their health draining,
-			-- which feels more honest than snapping straight to the value.
+			-- text tracks the slow bar so the number ticks down at the
+			-- same pace the bar drains. snapping the text feels gross.
 			local hp = math.floor(nextGrey * self.damageable.MaxHP)
 			if hp ~= self.lastHP then
 				self.lastHP = hp
@@ -337,8 +315,8 @@ function HealthGui.new(damageable: Damageable, billboardGui: BillboardGui): Heal
 	end
 
 	local function ensureLoop()
-		-- Reuse a running coroutine; never spawn a second one in parallel,
-		-- otherwise two threads would race to write the same UIGradient.
+		-- only one loop at a time! two threads writing the same gradient
+		-- = visual seizure
 		if self.lerpThread and coroutine.status(self.lerpThread) ~= "dead" then return end
 		self.lerpThread = task.spawn(runLoop)
 	end
@@ -347,9 +325,8 @@ function HealthGui.new(damageable: Damageable, billboardGui: BillboardGui): Heal
 		if self.destroyed then return end
 		local fraction = math.clamp(newHP / damageable.MaxHP, 0, 1)
 
-		-- Heals are snapped instantly. The grey-trail aesthetic exists to
-		-- communicate "damage just happened"; animating heals the same way
-		-- would imply damage and confuse the player.
+		-- heals just snap. the grey trail is the "ouch you took damage"
+		-- signal, animating heals the same way would lie to the player.
 		if newHP >= oldHP then
 			self.currentTarget = fraction
 			self.greyTarget = fraction
@@ -362,15 +339,15 @@ function HealthGui.new(damageable: Damageable, billboardGui: BillboardGui): Heal
 			return
 		end
 
-		-- For damage, just update the targets and wake the render loop;
-		-- the bright bar will race ahead and the grey bar will catch up.
+		-- damage: just move the targets and wake the loop, let physics
+		-- (well, exponentials) do the rest
 		self.currentTarget = fraction
 		self.greyTarget = fraction
 		ensureLoop()
 	end)
 
-	-- Auto-clean when the underlying Damageable goes away so callers do
-	-- not have to remember a paired :Destroy() call.
+	-- if the Damageable goes away, take the bar with it. saves callers
+	-- from having to remember a matching :Destroy()
 	self.diedConn = damageable.Died:Connect(function() self:Destroy() end)
 	self.destroyedConn = damageable.Destroyed:Connect(function() self:Destroy() end)
 
@@ -381,22 +358,20 @@ function HealthGui:Destroy()
 	local s = self :: any
 	if s.destroyed then return end
 	s.destroyed = true
-	-- Disconnect every signal we own. The render loop will notice the
-	-- destroyed flag on its next Heartbeat and exit by itself, so we do
-	-- not need to forcibly cancel the coroutine.
+	-- drop our connections. don't bother killing the render thread by
+	-- hand, it'll see the flag on its next Heartbeat and bail.
 	s.healthChangedConn:Disconnect()
 	s.diedConn:Disconnect()
 	s.destroyedConn:Disconnect()
 end
 
 --==================================================================--
--- MODULE EXPORT                                                     --
+-- exports                                                           --
 --==================================================================--
--- Both classes are returned from a single table so consumers do a single
--- require() and grab whichever piece they need:
---     local HS = require(HealthSystem)
---     local mob = HS.Damageable.new(part, 100)
---     local gui = HS.HealthGui.new(mob, billboard)
+-- one require, both classes:
+--   local HS = require(HealthSystem)
+--   local mob = HS.Damageable.new(part, 100)
+--   local gui = HS.HealthGui.new(mob, billboard)
 
 return {
 	Damageable = Damageable,
