@@ -1,4 +1,4 @@
--- Credits: Discord: kctwisten (Sariel) | Roblox: DankJang
+-- Credits: Discord: dankgang.3772 (Sariel) | Roblox: DankJang
 --!strict
 
 --[[
