@@ -1,0 +1,7 @@
+.claude/
+*.rbxl
+*.rbxlx
+*.rbxl.lock
+*.rbxlx.lock
+.DS_Store
+Thumbs.db
